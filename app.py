@@ -26,6 +26,7 @@ import zipfile
 import tempfile
 import shutil
 import os
+import pdfplumber
 
 app = FastAPI()
 load_dotenv()
@@ -723,6 +724,194 @@ def columns_match(cols1, cols2, threshold=0.6):
     print(f"   🔍 Column match ratio: {match_ratio:.2f} (threshold: {threshold}) = {'✅ MATCH' if result else '❌ NO MATCH'}")
     return result
 
+def looks_like_header(row):
+    """Enhanced heuristic: mostly non-empty strings, not numbers; short-ish cells."""
+    if not row or not isinstance(row, list):
+        return False
+    str_like = sum(1 for c in row if isinstance(c, str) and bool(re.search(r"[A-Za-z]", c or "")))
+    num_like = sum(1 for c in row if isinstance(c, str) and re.fullmatch(r"[-+]?[\d,.]+", (c or "").strip()))
+    avg_len = sum(len((c or "")) for c in row) / max(len(row), 1)
+    return (str_like >= max(1, len(row)//2)) and (num_like <= len(row)//3) and (avg_len <= 40)
+
+async def extract_pdf_with_pdfplumber(pdf_file_path: str) -> list:
+    """Extract tables using pdfplumber with enhanced settings"""
+    tables = []
+    header_candidates = []
+    
+    try:
+        with pdfplumber.open(pdf_file_path) as pdf:
+            total_pages = len(pdf.pages)
+            print(f"   📑 PDF has {total_pages} pages")
+            
+            for page_num, page in enumerate(pdf.pages):
+                # Extract tables from current page with improved settings
+                page_tables = page.extract_tables(
+                    table_settings={
+                        "vertical_strategy": "lines",
+                        "horizontal_strategy": "lines", 
+                        "intersection_tolerance": 5,
+                        "snap_tolerance": 3,
+                        "join_tolerance": 3
+                    }
+                )
+                
+                if page_tables:
+                    for table_idx, table in enumerate(page_tables):
+                        if table and len(table) > 0:
+                            # Enhanced header detection
+                            first_row = table[0] if table else None
+                            has_smart_header = looks_like_header(first_row) if first_row else False
+                            
+                            if has_smart_header and first_row:
+                                # Track this header pattern
+                                header_tuple = tuple((c or "").strip() for c in first_row)
+                                header_candidates.append(header_tuple)
+                                
+                                # Use first row as headers, rest as data
+                                headers = [str((c or "")).strip() for c in first_row]
+                                rows = table[1:] if len(table) > 1 else []
+                            else:
+                                # No clear header detected, use generic column names
+                                max_cols = max(len(row) for row in table) if table else 0
+                                headers = [f"column_{j+1}" for j in range(max_cols)]
+                                rows = table
+                            
+                            # Create DataFrame with better error handling
+                            try:
+                                if rows:  # Only if we have data rows
+                                    # Ensure all rows have same length as headers
+                                    normalized_rows = []
+                                    for row in rows:
+                                        normalized_row = []
+                                        for j in range(len(headers)):
+                                            if j < len(row):
+                                                normalized_row.append(row[j])
+                                            else:
+                                                normalized_row.append(None)
+                                        normalized_rows.append(normalized_row)
+                                    
+                                    df = pd.DataFrame(normalized_rows, columns=headers)
+                                    # Remove completely empty rows
+                                    df = df.dropna(how='all')
+                                    
+                                    if not df.empty:
+                                        tables.append(df)
+                                        header_info = "✓ Smart header" if has_smart_header else "⚡ Generic header"
+                                        print(f"   ✅ Page {page_num + 1}, Table {table_idx + 1}: {df.shape[0]} rows, {df.shape[1]} cols ({header_info})")
+                            except Exception as df_error:
+                                print(f"   ⚠️ Failed to create DataFrame for page {page_num + 1}, table {table_idx + 1}: {df_error}")
+        
+        # Check for consistent headers across pages
+        if header_candidates:
+            from collections import Counter
+            header_counter = Counter(header_candidates)
+            if header_counter:
+                most_common_header, frequency = header_counter.most_common(1)[0]
+                if frequency >= 2:
+                    print(f"   🔄 Found repeating header pattern across {frequency} tables: {list(most_common_header)[:3]}...")
+        
+        # If no tables found with default settings, try with more lenient settings
+        if not tables:
+            print("📄 Retrying with more lenient table detection settings...")
+            with pdfplumber.open(pdf_file_path) as pdf:
+                for page_num, page in enumerate(pdf.pages):
+                    # Try with more aggressive table detection
+                    page_tables = page.extract_tables(table_settings={
+                        "vertical_strategy": "text",  # More lenient
+                        "horizontal_strategy": "text",
+                        "snap_tolerance": 5,
+                        "join_tolerance": 5,
+                        "edge_min_length": 3
+                    })
+                    
+                    if page_tables:
+                        for table_idx, table in enumerate(page_tables):
+                            if table and len(table) > 1:
+                                # Use first row as headers for fallback method
+                                headers = [f"col_{j}" if not table[0][j] else str(table[0][j]).strip() 
+                                         for j in range(len(table[0]))]
+                                rows = table[1:]
+                                
+                                try:
+                                    df = pd.DataFrame(rows, columns=headers)
+                                    df = df.dropna(how='all')
+                                    
+                                    if not df.empty:
+                                        tables.append(df)
+                                        print(f"   ✅ Page {page_num + 1}, Table {table_idx + 1}: {df.shape[0]} rows, {df.shape[1]} cols (fallback)")
+                                except Exception as df_error:
+                                    print(f"   ⚠️ Fallback failed for page {page_num + 1}, table {table_idx + 1}: {df_error}")
+                                    
+    except Exception as e:
+        print(f"❌ pdfplumber extraction failed for {pdf_file_path}: {e}")
+        
+    return tables
+
+async def process_image_with_enhanced_ocr(image_bytes: bytes, filename: str, question_text: str) -> str:
+    """Enhanced image processing with content analysis"""
+    try:
+        print(f"🖼️ Processing image: {filename}")
+        
+        if not ocr_api_key:
+            print("⚠️ OCR_API_KEY not found - skipping image processing")
+            return question_text + "\n\nOCR API key not configured - image text extraction skipped"
+        
+        base64_image = base64.b64encode(image_bytes).decode("utf-8")
+        
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+            form_data = {
+                "base64Image": f"data:image/png;base64,{base64_image}",
+                "apikey": ocr_api_key,
+                "language": "eng",
+                "scale": "true",
+                "OCREngine": "1"
+            }
+            
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            }
+            
+            response = await client.post(OCR_API_URL, data=form_data, headers=headers)
+            
+            if response.status_code == 200:
+                result = response.json()
+                
+                if not result.get('IsErroredOnProcessing', True):
+                    parsed_results = result.get('ParsedResults', [])
+                    if parsed_results:
+                        image_text = parsed_results[0].get('ParsedText', '').strip()
+                        if image_text:
+                            question_text += f"\n\nExtracted from image ({filename}):\n{image_text}"
+                            print(f"✅ Text extracted from image: {filename}")
+                            
+                            # Analyze what type of content was found
+                            content_keywords = ['table', 'chart', 'graph', 'data', 'figure', 'diagram']
+                            question_keywords = ['?', 'what', 'how', 'when', 'where', 'why', 'which']
+                            
+                            if any(keyword in image_text.lower() for keyword in content_keywords):
+                                question_text += f"\n\nData Analysis Request: Please analyze the data content shown in the image."
+                            
+                            if any(keyword in image_text.lower() for keyword in question_keywords):
+                                question_text += f"\n\nQuestions found in image - please address them."
+                                
+                            # Look for specific data patterns
+                            if re.search(r'\d+[.,]\d+', image_text):  # Numbers with decimals
+                                question_text += f"\n\nNumerical data detected in image - please extract and analyze."
+                                
+                        else:
+                            print("ℹ️ OCR completed but no text found")
+                    else:
+                        print("ℹ️ OCR completed but no results returned")
+                else:
+                    print(f"❌ OCR processing failed: {result.get('ErrorMessage', 'Unknown error')}")
+            else:
+                print(f"❌ OCR API error: {response.status_code}")
+                
+    except Exception as e:
+        print(f"❌ Error processing image {filename}: {e}")
+        
+    return question_text
+
 async def process_pdf_files() -> list:
     """Process all PDF files in current directory and extract tables, combining tables with same headers"""
     pdf_data = []
@@ -737,39 +926,42 @@ async def process_pdf_files() -> list:
     
     all_raw_tables = []  # Store all raw tables
     
-    # First pass: Extract ALL raw tables from ALL PDFs (no processing at all)
+    # First pass: Extract ALL raw tables from ALL PDFs using enhanced extraction
     print("🔄 Phase 1: Extracting raw tables from all PDFs...")
     for i, pdf_file in enumerate(pdf_files):
         try:
             print(f"📄 Processing PDF {i+1}/{len(pdf_files)}: {pdf_file}")
             
-            # Extract all tables from PDF using tabula
-            try:
-                # Extract tables with various configurations to catch different table formats
-                tables = tabula.read_pdf(
-                    pdf_file, 
-                    pages='all', 
-                    multiple_tables=True,
-                    pandas_options={'header': 'infer'},
-                    lattice=True,  # For tables with clear borders
-                    silent=True
-                )
-                
-                # If lattice method didn't work well, try stream method
-                if not tables or all(df.empty for df in tables):
-                    print("📄 Retrying with stream method...")
+            # Try pdfplumber first (better table detection)
+            tables = await extract_pdf_with_pdfplumber(pdf_file)
+            
+            # If pdfplumber didn't work well, fallback to tabula
+            if not tables or len(tables) == 0:
+                print("📄 pdfplumber found no tables, trying tabula as fallback...")
+                try:
                     tables = tabula.read_pdf(
                         pdf_file, 
                         pages='all', 
                         multiple_tables=True,
                         pandas_options={'header': 'infer'},
-                        stream=True,  # For tables without clear borders
+                        lattice=True,
                         silent=True
                     )
-                
-            except Exception as tabula_error:
-                print(f"❌ Tabula extraction failed for {pdf_file}: {tabula_error}")
-                continue
+                    
+                    if not tables or all(df.empty for df in tables):
+                        print("📄 Retrying tabula with stream method...")
+                        tables = tabula.read_pdf(
+                            pdf_file, 
+                            pages='all', 
+                            multiple_tables=True,
+                            pandas_options={'header': 'infer'},
+                            stream=True,
+                            silent=True
+                        )
+                        
+                except Exception as tabula_error:
+                    print(f"❌ Both pdfplumber and tabula failed for {pdf_file}: {tabula_error}")
+                    continue
             
             if not tables:
                 print(f"⚠️ No tables found in {pdf_file}")
@@ -777,7 +969,7 @@ async def process_pdf_files() -> list:
             
             print(f"📊 Found {len(tables)} raw tables in {pdf_file}")
             
-            # Store all raw tables with metadata (NO PROCESSING)
+            # Store all raw tables with metadata
             for j, raw_df in enumerate(tables):
                 if raw_df.empty:
                     print(f"⚠️ Table {j+1} is empty, skipping")
@@ -787,7 +979,10 @@ async def process_pdf_files() -> list:
                     "raw_dataframe": raw_df,
                     "source_pdf": pdf_file,
                     "table_number": j + 1,
-                    "raw_columns": list(raw_df.columns)
+                    "raw_columns": list(raw_df.columns),
+                    "estimated_rows": len(raw_df),
+                    "has_smart_headers": any(col.replace('_', ' ').replace('-', ' ').strip() 
+                                           for col in raw_df.columns if not col.startswith('column_'))
                 }
                 
                 all_raw_tables.append(table_metadata)
@@ -840,7 +1035,7 @@ async def process_pdf_files() -> list:
         for table in group_data['raw_tables']:
             print(f"      - {table['source_pdf']} (table {table['table_number']})")
     
-    # Third pass: Simply merge tables and save (NO data_scrape processing)
+    # Third pass: Simply merge tables and save
     print("\n🔄 Phase 3: Merging grouped tables and saving...")
     
     for group_name, group_data in combined_data_groups.items():
@@ -852,9 +1047,10 @@ async def process_pdf_files() -> list:
         # Merge all raw tables in this group
         combined_raw_dfs = []
         source_pdfs = []
+        total_estimated_rows = 0
         
         for table_meta in raw_tables_in_group:
-            raw_df = table_meta["raw_dataframe"].copy()  # Make a copy to avoid modifying original
+            raw_df = table_meta["raw_dataframe"].copy()
             
             # Ensure column names match the reference
             if list(raw_df.columns) != reference_columns:
@@ -867,6 +1063,7 @@ async def process_pdf_files() -> list:
             
             combined_raw_dfs.append(raw_df)
             source_pdfs.append(table_meta["source_pdf"])
+            total_estimated_rows += table_meta.get("estimated_rows", len(raw_df))
             print(f"   ✅ Added {raw_df.shape[0]} rows from {table_meta['source_pdf']}")
         
         # Combine all raw DataFrames
@@ -877,16 +1074,14 @@ async def process_pdf_files() -> list:
             
             # Create a meaningful filename
             if len(combined_data_groups) == 1:
-                # Only one type of table across all PDFs
                 csv_filename = "combined_tables.csv"
             else:
-                # Multiple different table types
                 first_col = reference_columns[0] if reference_columns else "data"
                 clean_name = re.sub(r'[^\w\s-]', '', str(first_col)).strip()
                 clean_name = re.sub(r'[-\s]+', '_', clean_name)
                 csv_filename = f"combined_{clean_name[:20]}.csv"
             
-            # Save the merged data directly (no processing)
+            # Save the merged data
             merged_df.to_csv(csv_filename, index=False, encoding="utf-8")
             
             table_info = {
@@ -896,8 +1091,10 @@ async def process_pdf_files() -> list:
                 "shape": merged_df.shape,
                 "columns": list(merged_df.columns),
                 "sample_data": merged_df.head(3).to_dict('records'),
-                "description": f"Combined raw table from {len(set(source_pdfs))} PDF file(s) ({len(raw_tables_in_group)} table(s) total)",
-                "formatting_applied": "None - raw data preserved"
+                "description": f"Combined table from {len(set(source_pdfs))} PDF file(s) ({len(raw_tables_in_group)} table(s) total)",
+                "formatting_applied": "Enhanced extraction with pdfplumber and tabula fallback",
+                "extraction_method": "pdfplumber with smart header detection",
+                "estimated_total_rows": total_estimated_rows
             }
             
             pdf_data.append(table_info)
@@ -920,8 +1117,8 @@ async def process_pdf_files() -> list:
                     "shape": raw_df.shape,
                     "columns": list(raw_df.columns),
                     "sample_data": raw_df.head(3).to_dict('records'),
-                    "description": f"Fallback raw table from {table_meta['source_pdf']} (merge failed)",
-                    "formatting_applied": "None - raw data preserved"
+                    "description": f"Fallback table from {table_meta['source_pdf']} (merge failed)",
+                    "formatting_applied": "Enhanced extraction with pdfplumber"
                 }
                 
                 pdf_data.append(table_info)
@@ -1167,43 +1364,11 @@ async def aianalyst(request: Request):
         question_text = "No questions provided"
 
     # Handle image if provided (existing logic)
+    # Handle image if provided (enhanced logic)
     if image:
         try:
             image_bytes = await image.read()
-            base64_image = base64.b64encode(image_bytes).decode("utf-8")
-            
-            if not ocr_api_key:
-                print("⚠️ OCR_API_KEY not found - skipping image processing")
-                question_text += "\n\nOCR API key not configured - image text extraction skipped"
-            else:
-                async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-                    form_data = {
-                        "base64Image": f"data:image/png;base64,{base64_image}",
-                        "apikey": ocr_api_key,
-                        "language": "eng",
-                        "scale": "true",
-                        "OCREngine": "1"
-                    }
-                    
-                    headers = {
-                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-                    }
-                    
-                    response = await client.post(OCR_API_URL, data=form_data, headers=headers)
-                    
-                    if response.status_code == 200:
-                        result = response.json()
-                        
-                        if not result.get('IsErroredOnProcessing', True):
-                            parsed_results = result.get('ParsedResults', [])
-                            if parsed_results:
-                                image_text = parsed_results[0].get('ParsedText', '').strip()
-                                if image_text:
-                                    question_text += f"\n\nExtracted from image:\n{image_text}"
-                                    print("✅ Text extracted from image")
-                    else:
-                        print(f"❌ OCR API error: {response.status_code}")
-                    
+            question_text = await process_image_with_enhanced_ocr(image_bytes, image.filename, question_text)
         except Exception as e:
             print(f"❌ Error extracting text from image: {e}")
 
@@ -1243,44 +1408,15 @@ async def aianalyst(request: Request):
                     print(f"⚠️ Failed to read extracted text file {txt_file_path}: {e}")
             
             # Process extracted images for OCR
+            # Process extracted images with enhanced OCR
             for img_file_path in extracted_from_archives['image_files']:
-                if not ocr_api_key:
-                    print("⚠️ OCR_API_KEY not found - skipping extracted image processing")
-                    continue
-                    
                 try:
                     with open(img_file_path, 'rb') as f:
                         image_bytes = f.read()
-                    base64_image = base64.b64encode(image_bytes).decode("utf-8")
                     
-                    async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-                        form_data = {
-                            "base64Image": f"data:image/png;base64,{base64_image}",
-                            "apikey": ocr_api_key,
-                            "language": "eng",
-                            "scale": "true",
-                            "OCREngine": "1"
-                        }
-                        
-                        headers = {
-                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-                        }
-                        
-                        response = await client.post(OCR_API_URL, data=form_data, headers=headers)
-                        
-                        if response.status_code == 200:
-                            result = response.json()
-                            
-                            if not result.get('IsErroredOnProcessing', True):
-                                parsed_results = result.get('ParsedResults', [])
-                                if parsed_results:
-                                    image_text = parsed_results[0].get('ParsedText', '').strip()
-                                    if image_text:
-                                        question_text += f"\n\nExtracted from archive image ({os.path.basename(img_file_path)}):\n{image_text}"
-                                        print(f"✅ Text extracted from archive image: {os.path.basename(img_file_path)}")
-                        else:
-                            print(f"❌ OCR API error for {img_file_path}: {response.status_code}")
-                            
+                    filename = os.path.basename(img_file_path)
+                    question_text = await process_image_with_enhanced_ocr(image_bytes, f"archive_{filename}", question_text)
+                    
                 except Exception as e:
                     print(f"❌ Error processing extracted image {img_file_path}: {e}")
                     
@@ -1556,6 +1692,7 @@ async def aianalyst(request: Request):
             print(f"❌ Error processing extracted JSON {json_file_path}: {e}")
 
     # Step 3.5: Handle provided PDF file
+    # Step 3.5: Handle provided PDF file (enhanced)
     uploaded_pdf_data = []
     if pdf:
         try:
@@ -1566,38 +1703,42 @@ async def aianalyst(request: Request):
             temp_pdf_filename = f"uploaded_{pdf.filename}" if pdf.filename else "uploaded_file.pdf"
             with open(temp_pdf_filename, "wb") as f:
                 f.write(pdf_content)
-            created_files.add(os.path.normpath(temp_pdf_filename))                                                                                            
+            created_files.add(os.path.normpath(temp_pdf_filename))
             
             print(f"📄 Saved uploaded PDF as {temp_pdf_filename}")
 
-            # Extract tables (raw) then group & merge by header before any CSV creation
-            try:
-                tables = tabula.read_pdf(
-                temp_pdf_filename,
-                pages='all',
-                multiple_tables=True,
-                pandas_options={'header': 'infer'},
-                lattice=True,
-                silent=True
-            )
-                if not tables or all(df.empty for df in tables):
-                    print("📄 Retrying with stream method...")
+            # Try pdfplumber first, then tabula as fallback
+            tables = await extract_pdf_with_pdfplumber(temp_pdf_filename)
+            
+            if not tables:
+                print("📄 pdfplumber found no tables, trying tabula...")
+                try:
                     tables = tabula.read_pdf(
                         temp_pdf_filename,
                         pages='all',
                         multiple_tables=True,
                         pandas_options={'header': 'infer'},
-                        stream=True,
+                        lattice=True,
                         silent=True
                     )
-            except Exception as tabula_error:
-                print(f"❌ Tabula extraction failed for uploaded PDF: {tabula_error}")
-                tables = []
+                    if not tables or all(df.empty for df in tables):
+                        print("📄 Retrying with stream method...")
+                        tables = tabula.read_pdf(
+                            temp_pdf_filename,
+                            pages='all',
+                            multiple_tables=True,
+                            pandas_options={'header': 'infer'},
+                            stream=True,
+                            silent=True
+                        )
+                except Exception as tabula_error:
+                    print(f"❌ Both extraction methods failed for uploaded PDF: {tabula_error}")
+                    tables = []
 
             if not tables:
                 print("⚠️ No tables found in uploaded PDF")
             else:
-                print(f"📊 Found {len(tables)} raw tables (pages) in uploaded PDF – grouping by header before saving")
+                print(f"📊 Found {len(tables)} tables in uploaded PDF – grouping by header before saving")
                 raw_tables = []
                 for j, raw_df in enumerate(tables):
                     if raw_df.empty:
@@ -1631,7 +1772,8 @@ async def aianalyst(request: Request):
 
                 for g_idx, grp in enumerate(groups, start=1):
                     merged_df = pd.concat([t["dataframe"].copy() for t in grp["tables"]], ignore_index=True)
-                    print(f"🔗 Group {g_idx}: merged {len(grp['tables'])} page tables into {merged_df.shape[0]} rows")
+                    print(f"🔗 Group {g_idx}: merged {len(grp['tables'])} tables into {merged_df.shape[0]} rows")
+                    
                     try:
                         cleaned_df, formatting_results = await sourcer.numeric_formatter.format_dataframe_numerics(merged_df)
                     except Exception as fmt_err:
@@ -1640,16 +1782,17 @@ async def aianalyst(request: Request):
                         formatting_results = {}
 
                     if single_group:
-                        csv_filename = "data.csv"
+                        csv_filename = "uploaded_pdf_data.csv"
                     else:
                         first_col = grp["reference_columns"][0] if grp["reference_columns"] else f"group_{g_idx}"
                         safe_part = re.sub(r'[^A-Za-z0-9_]+', '_', str(first_col))[:20]
-                        csv_filename = f"{base_name}_{safe_part or 'group'}_{g_idx}.csv"
+                        csv_filename = f"uploaded_pdf_{safe_part or 'group'}_{g_idx}.csv"
 
                     cleaned_df.to_csv(csv_filename, index=False, encoding="utf-8")
                     created_files.add(os.path.normpath(csv_filename))
+                    
                     table_info = {
-                        "filename": csv_filename,  # Add this
+                        "filename": csv_filename,
                         "source_pdf": temp_pdf_filename,
                         "table_number": g_idx,
                         "merged_from_tables": [t["table_number"] for t in grp["tables"]],
@@ -1657,7 +1800,7 @@ async def aianalyst(request: Request):
                         "shape": cleaned_df.shape,
                         "columns": list(cleaned_df.columns),
                         "sample_data": cleaned_df.head(3).to_dict('records'),
-                        "description": f"Merged table from uploaded PDF (group {g_idx}) combining {len(grp['tables'])} page tables with identical/compatible headers",
+                        "description": f"Enhanced table from uploaded PDF (group {g_idx}) combining {len(grp['tables'])} tables",
                         "formatting_applied": formatting_results
                     }
                     uploaded_pdf_data.append(table_info)
@@ -1666,42 +1809,47 @@ async def aianalyst(request: Request):
             print(f"❌ Error processing uploaded PDF: {e}")
 
     # Process extracted PDF files from archives
+    # Process extracted PDF files from archives
     extracted_pdf_data = []
     for i, pdf_file_path in enumerate(extracted_from_archives['pdf_files']):
         try:
             print(f"📄 Processing extracted PDF {i+1}: {os.path.basename(pdf_file_path)}")
             
-            # Extract tables from the PDF
-            try:
-                tables = tabula.read_pdf(
-                    pdf_file_path,
-                    pages='all',
-                    multiple_tables=True,
-                    pandas_options={'header': 'infer'},
-                    lattice=True,
-                    silent=True
-                )
-                if not tables or all(df.empty for df in tables):
-                    print(f"📄 Retrying with stream method for {os.path.basename(pdf_file_path)}...")
+            # Try pdfplumber first, then tabula as fallback
+            tables = await extract_pdf_with_pdfplumber(pdf_file_path)
+            
+            if not tables:
+                print(f"📄 pdfplumber found no tables, trying tabula for {os.path.basename(pdf_file_path)}...")
+                try:
                     tables = tabula.read_pdf(
                         pdf_file_path,
                         pages='all',
                         multiple_tables=True,
                         pandas_options={'header': 'infer'},
-                        stream=True,
+                        lattice=True,
                         silent=True
                     )
-            except Exception as tabula_error:
-                print(f"❌ Tabula extraction failed for {pdf_file_path}: {tabula_error}")
-                tables = []
+                    if not tables or all(df.empty for df in tables):
+                        print(f"📄 Retrying with stream method for {os.path.basename(pdf_file_path)}...")
+                        tables = tabula.read_pdf(
+                            pdf_file_path,
+                            pages='all',
+                            multiple_tables=True,
+                            pandas_options={'header': 'infer'},
+                            stream=True,
+                            silent=True
+                        )
+                except Exception as tabula_error:
+                    print(f"❌ Both extraction methods failed for {pdf_file_path}: {tabula_error}")
+                    continue
 
             if not tables:
                 print(f"⚠️ No tables found in extracted PDF {os.path.basename(pdf_file_path)}")
                 continue
                 
-            print(f"📊 Found {len(tables)} raw tables in extracted PDF – processing...")
+            print(f"📊 Found {len(tables)} tables in extracted PDF – processing...")
             
-            # Group tables by similar headers (simplified version)
+            # Process each table
             base_name = os.path.splitext(os.path.basename(pdf_file_path))[0]
             sourcer = data_scrape.ImprovedWebScraper()
             
@@ -1727,9 +1875,10 @@ async def aianalyst(request: Request):
                     "shape": cleaned_df.shape,
                     "columns": list(cleaned_df.columns),
                     "sample_data": cleaned_df.head(3).to_dict('records'),
-                    "description": f"Table extracted from archive PDF: {os.path.basename(pdf_file_path)} (table {j+1})",
+                    "description": f"Enhanced table extracted from archive PDF: {os.path.basename(pdf_file_path)} (table {j+1})",
                     "formatting_applied": formatting_results,
-                    "source": "archive_extraction"
+                    "source": "archive_extraction",
+                    "extraction_method": "pdfplumber with tabula fallback"
                 }
                 extracted_pdf_data.append(table_info)
                 print(f"💾 Saved extracted PDF table as {csv_filename}")
