@@ -28,6 +28,8 @@ import tempfile
 import shutil
 
 import pdfplumber
+import openpyxl
+from openpyxl import load_workbook
 
 app = FastAPI()
 load_dotenv()
@@ -137,6 +139,7 @@ async def extract_archive_contents(file_upload: UploadFile, temp_dir: str) -> di
     extracted_files = {
         'csv_files': [],
         'json_files': [],
+        'excel_files': [],
         'pdf_files': [],
         'html_files': [],
         'image_files': [],
@@ -208,6 +211,8 @@ async def extract_archive_contents(file_upload: UploadFile, temp_dir: str) -> di
                     extracted_files['csv_files'].append(file_path)
                 elif filename_lower.endswith('.json'):
                     extracted_files['json_files'].append(file_path)
+                elif filename_lower.endswith(('.xlsx', '.xls')):
+                    extracted_files['excel_files'].append(file_path)
                 elif filename_lower.endswith('.pdf'):
                     extracted_files['pdf_files'].append(file_path)
                 elif filename_lower.endswith(('.html', '.htm')):
@@ -576,13 +581,15 @@ def extract_urls_with_regex(question_text: str, uploaded_files: list = None) -> 
             continue
         
         # Check if it's a database file
-        if any(ext in clean_url.lower() for ext in ['.parquet', '.csv', '.json', '.sql']):
+        if any(ext in clean_url.lower() for ext in ['.parquet', '.csv', '.json', '.sql', '.xlsx', '.xls']):
             if ".parquet" in clean_url:
                 format_type = "parquet"
             elif ".csv" in clean_url:
                 format_type = "csv"
             elif ".sql" in clean_url:
                 format_type = "sql"
+            elif ".xlsx" in clean_url or ".xls" in clean_url:
+                format_type = "excel"
             else:
                 format_type = "json"
             database_files.append({
@@ -1680,6 +1687,166 @@ async def create_sql_summary_file(sql_info: dict, output_filename: str = None) -
     return output_filename
 
 
+async def process_excel_files() -> list:
+    """Process all Excel files (.xlsx, .xls) in current directory and extract all sheets and workbook information"""
+    excel_data = []
+    
+    # Find all Excel files in current directory
+    excel_files = glob.glob("*.xlsx") + glob.glob("*.xls")
+    if not excel_files:
+        print("📊 No Excel files found in current directory")
+        return excel_data
+    
+    print(f"📊 Found {len(excel_files)} Excel files to process")
+    
+    for i, excel_file in enumerate(excel_files):
+        try:
+            print(f"📊 Processing Excel file {i+1}/{len(excel_files)}: {excel_file}")
+            
+            # Load workbook with openpyxl (supports both .xlsx and .xls)
+            workbook = load_workbook(excel_file, read_only=True, data_only=True)
+            
+            workbook_info = {
+                "filename": excel_file,
+                "total_sheets": len(workbook.sheetnames),
+                "sheet_names": workbook.sheetnames,
+                "sheets_data": []
+            }
+            
+            print(f"📋 Found {len(workbook.sheetnames)} sheets: {workbook.sheetnames}")
+            
+            # Process each sheet
+            for sheet_idx, sheet_name in enumerate(workbook.sheetnames):
+                try:
+                    print(f"   📄 Processing sheet {sheet_idx+1}/{len(workbook.sheetnames)}: '{sheet_name}'")
+                    
+                    # Read sheet data using pandas (which handles Excel files well)
+                    sheet_df = pd.read_excel(excel_file, sheet_name=sheet_name, engine='openpyxl')
+                    
+                    if sheet_df.empty:
+                        print(f"   ⚠️ Sheet '{sheet_name}' is empty, skipping")
+                        continue
+                    
+                    # Clean column names
+                    sheet_df.columns = [str(col).strip() for col in sheet_df.columns]
+                    
+                    # Remove completely empty rows and columns
+                    sheet_df = sheet_df.dropna(axis=0, how='all').dropna(axis=1, how='all')
+                    
+                    if sheet_df.empty:
+                        print(f"   ⚠️ Sheet '{sheet_name}' has no data after cleaning, skipping")
+                        continue
+                    
+                    # Generate CSV filename for this sheet
+                    safe_sheet_name = re.sub(r'[^\w\-_\.]', '_', sheet_name)
+                    safe_filename = re.sub(r'[^\w\-_\.]', '_', os.path.splitext(excel_file)[0])
+                    csv_filename = f"{safe_filename}_{safe_sheet_name}.csv"
+                    
+                    # Save sheet as CSV
+                    sheet_df.to_csv(csv_filename, index=False, encoding='utf-8')
+                    
+                    # Get sheet information
+                    sheet_info = {
+                        "sheet_name": sheet_name,
+                        "csv_filename": csv_filename,
+                        "shape": list(sheet_df.shape),
+                        "columns": list(sheet_df.columns),
+                        "data_types": {col: str(dtype) for col, dtype in sheet_df.dtypes.items()},
+                        "sample_data": sheet_df.head(3).to_dict('records'),
+                        "has_header": not any(col.startswith('Unnamed:') for col in sheet_df.columns),
+                        "non_null_counts": sheet_df.count().to_dict()
+                    }
+                    
+                    workbook_info["sheets_data"].append(sheet_info)
+                    
+                    print(f"   ✅ Sheet '{sheet_name}' saved as {csv_filename} ({sheet_df.shape[0]} rows, {sheet_df.shape[1]} cols)")
+                    print(f"      📋 Columns: {list(sheet_df.columns)}")
+                    
+                except Exception as sheet_error:
+                    print(f"   ❌ Error processing sheet '{sheet_name}': {sheet_error}")
+                    continue
+            
+            if workbook_info["sheets_data"]:
+                excel_data.append(workbook_info)
+                
+                # Create workbook summary file
+                await create_excel_summary_file(workbook_info)
+                
+            workbook.close()
+            
+        except Exception as e:
+            print(f"❌ Failed to process Excel file {excel_file}: {e}")
+    
+    if excel_data:
+        print(f"\n✅ Excel processing complete: Processed {len(excel_data)} workbooks with {sum(len(wb['sheets_data']) for wb in excel_data)} total sheets")
+    
+    return excel_data
+
+
+async def create_excel_summary_file(workbook_info: dict, output_filename: str = None) -> str:
+    """Create a comprehensive summary file for Excel workbook information"""
+    if not output_filename:
+        safe_filename = re.sub(r'[^\w\-_\.]', '_', os.path.splitext(workbook_info['filename'])[0])
+        output_filename = f"excel_summary_{safe_filename}.txt"
+    
+    summary_content = []
+    summary_content.append("="*60)
+    summary_content.append("EXCEL WORKBOOK SUMMARY")
+    summary_content.append("="*60)
+    summary_content.append(f"Source File: {workbook_info['filename']}")
+    summary_content.append(f"Total Sheets: {workbook_info['total_sheets']}")
+    summary_content.append(f"Processed Sheets: {len(workbook_info['sheets_data'])}")
+    summary_content.append(f"Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    summary_content.append("")
+    
+    summary_content.append("SHEET OVERVIEW:")
+    summary_content.append("-" * 40)
+    for i, sheet_name in enumerate(workbook_info['sheet_names'], 1):
+        processed_sheet = next((s for s in workbook_info['sheets_data'] if s['sheet_name'] == sheet_name), None)
+        if processed_sheet:
+            summary_content.append(f"{i}. {sheet_name} ✅")
+            summary_content.append(f"   → {processed_sheet['csv_filename']}")
+            summary_content.append(f"   → {processed_sheet['shape'][0]} rows × {processed_sheet['shape'][1]} columns")
+        else:
+            summary_content.append(f"{i}. {sheet_name} ❌ (skipped - empty or error)")
+    summary_content.append("")
+    
+    # Detailed sheet information
+    for sheet_info in workbook_info['sheets_data']:
+        summary_content.append(f"SHEET: {sheet_info['sheet_name']}")
+        summary_content.append("-" * 30)
+        summary_content.append(f"Output File: {sheet_info['csv_filename']}")
+        summary_content.append(f"Dimensions: {sheet_info['shape'][0]} rows × {sheet_info['shape'][1]} columns")
+        summary_content.append(f"Has Header: {sheet_info['has_header']}")
+        summary_content.append("")
+        
+        summary_content.append("Columns:")
+        for i, col in enumerate(sheet_info['columns'], 1):
+            data_type = sheet_info['data_types'].get(col, 'unknown')
+            non_null_count = sheet_info['non_null_counts'].get(col, 0)
+            summary_content.append(f"  {i:2d}. {col} ({data_type}) - {non_null_count} non-null values")
+        summary_content.append("")
+        
+        if sheet_info['sample_data']:
+            summary_content.append("Sample Data (first 3 rows):")
+            for row_idx, row in enumerate(sheet_info['sample_data'], 1):
+                summary_content.append(f"  Row {row_idx}: {row}")
+            summary_content.append("")
+        
+        summary_content.append("")
+    
+    summary_content.append("="*60)
+    summary_content.append("END OF EXCEL SUMMARY")
+    summary_content.append("="*60)
+    
+    # Write summary to file
+    summary_text = "\n".join(summary_content)
+    safe_write(output_filename, summary_text)
+    
+    print(f"📄 Excel summary saved to: {output_filename}")
+    return output_filename
+
+
 async def get_database_schemas(database_files: list, created_files: set = None) -> list:
     """Get schema and sample data from database files without loading full data"""
     database_info = []
@@ -1831,6 +1998,7 @@ def create_data_summary(csv_data: list,
                         extracted_csv_data: list = None,
                         extracted_html_data: list = None,
                         extracted_json_data: list = None,
+                        extracted_excel_data: list = None,
                         extracted_sql_data: list = None,
                         extracted_data_files: list = None) -> dict:
     """Create comprehensive data summary for LLM code generation.
@@ -1850,6 +2018,7 @@ def create_data_summary(csv_data: list,
             "csv_files": [],
             "html_files": [],
             "json_files": [],
+            "excel_files": [],
             "sql_files": []
         },
         "extracted_from_text_images": [],  # New category for text/image extracted data
@@ -1873,6 +2042,8 @@ def create_data_summary(csv_data: list,
         summary["extracted_from_archives"]["html_files"] = extracted_html_data
     if extracted_json_data:
         summary["extracted_from_archives"]["json_files"] = extracted_json_data
+    if extracted_excel_data:
+        summary["extracted_from_archives"]["excel_files"] = extracted_excel_data
     if extracted_sql_data:
         summary["extracted_from_archives"]["sql_files"] = extracted_sql_data
 
@@ -2021,6 +2192,7 @@ async def aianalyst(request: Request):
     extracted_from_archives = {
         'csv_files': [],
         'json_files': [],
+        'excel_files': [],
         'pdf_files': [],
         'html_files': [],
         'image_files': [],
@@ -2453,6 +2625,125 @@ async def aianalyst(request: Request):
         except Exception as e:
             print(f"❌ Error processing extracted SQL {sql_file_path}: {e}")
 
+    # Process extracted Excel files from archives
+    extracted_excel_data = []
+    for i, excel_file_path in enumerate(extracted_from_archives.get('excel_files', [])):
+        try:
+            print(f"📊 Processing extracted Excel {i+1}: {os.path.basename(excel_file_path)}")
+            
+            # Copy to workspace with a proper name
+            output_excel_name = f"ExtractedExcel_{i+1}_{os.path.basename(excel_file_path)}"
+            shutil.copy2(excel_file_path, output_excel_name)
+            created_files.add(os.path.normpath(output_excel_name))
+            
+            # Process the Excel file
+            try:
+                workbook = load_workbook(output_excel_name, read_only=True, data_only=True)
+                
+                workbook_info = {
+                    "filename": output_excel_name,
+                    "original_source": excel_file_path,
+                    "total_sheets": len(workbook.sheetnames),
+                    "sheet_names": workbook.sheetnames,
+                    "sheets_data": []
+                }
+                
+                print(f"📋 Found {len(workbook.sheetnames)} sheets: {workbook.sheetnames}")
+                
+                # Process each sheet
+                for sheet_idx, sheet_name in enumerate(workbook.sheetnames):
+                    try:
+                        print(f"   📄 Processing sheet {sheet_idx+1}/{len(workbook.sheetnames)}: '{sheet_name}'")
+                        
+                        # Read sheet data using pandas
+                        sheet_df = pd.read_excel(output_excel_name, sheet_name=sheet_name, engine='openpyxl')
+                        
+                        if sheet_df.empty:
+                            print(f"   ⚠️ Sheet '{sheet_name}' is empty, skipping")
+                            continue
+                        
+                        # Clean column names and remove empty rows/columns
+                        sheet_df.columns = [str(col).strip() for col in sheet_df.columns]
+                        sheet_df = sheet_df.dropna(axis=0, how='all').dropna(axis=1, how='all')
+                        
+                        if sheet_df.empty:
+                            print(f"   ⚠️ Sheet '{sheet_name}' has no data after cleaning, skipping")
+                            continue
+                        
+                        # Generate CSV filename for this sheet
+                        safe_sheet_name = re.sub(r'[^\w\-_\.]', '_', sheet_name)
+                        safe_filename = re.sub(r'[^\w\-_\.]', '_', os.path.splitext(output_excel_name)[0])
+                        csv_filename = f"extracted_{safe_filename}_{safe_sheet_name}.csv"
+                        
+                        # Save sheet as CSV
+                        sheet_df.to_csv(csv_filename, index=False, encoding='utf-8')
+                        created_files.add(os.path.normpath(csv_filename))
+                        
+                        # Get sheet information
+                        sheet_info = {
+                            "sheet_name": sheet_name,
+                            "csv_filename": csv_filename,
+                            "shape": list(sheet_df.shape),
+                            "columns": list(sheet_df.columns),
+                            "data_types": {col: str(dtype) for col, dtype in sheet_df.dtypes.items()},
+                            "sample_data": sheet_df.head(3).to_dict('records'),
+                            "has_header": not any(col.startswith('Unnamed:') for col in sheet_df.columns),
+                            "non_null_counts": sheet_df.count().to_dict()
+                        }
+                        
+                        workbook_info["sheets_data"].append(sheet_info)
+                        
+                        print(f"   ✅ Sheet '{sheet_name}' saved as {csv_filename} ({sheet_df.shape[0]} rows, {sheet_df.shape[1]} cols)")
+                        
+                    except Exception as sheet_error:
+                        print(f"   ❌ Error processing sheet '{sheet_name}': {sheet_error}")
+                        continue
+                
+                workbook.close()
+                
+                if workbook_info["sheets_data"]:
+                    # Create workbook summary file
+                    summary_filename = await create_excel_summary_file(workbook_info, f"extracted_excel_summary_{i+1}_{int(time.time())}.txt")
+                    created_files.add(os.path.normpath(summary_filename))
+                    
+                    excel_info = {
+                        "filename": output_excel_name,
+                        "summary_file": summary_filename,
+                        "total_sheets": workbook_info["total_sheets"],
+                        "processed_sheets": len(workbook_info["sheets_data"]),
+                        "sheet_names": workbook_info["sheet_names"],
+                        "csv_files": [sheet["csv_filename"] for sheet in workbook_info["sheets_data"]],
+                        "description": f"Excel workbook extracted from archive: {os.path.basename(excel_file_path)} ({len(workbook_info['sheets_data'])} sheets processed)",
+                        "source": "archive_extraction"
+                    }
+                    
+                    extracted_excel_data.append(excel_info)
+                    
+                    # Add to extracted data files list
+                    extracted_data_files_list.append({
+                        "type": "excel_workbook",
+                        "filename": output_excel_name,
+                        "summary_file": summary_filename,
+                        "info": excel_info
+                    })
+                    
+                    print(f"📊 Extracted Excel processed: {len(workbook_info['sheets_data'])} sheets, saved as {output_excel_name}")
+                else:
+                    print(f"⚠️ No processable sheets found in extracted Excel {excel_file_path}")
+                    
+            except Exception as excel_error:
+                print(f"❌ Error processing extracted Excel workbook {excel_file_path}: {excel_error}")
+                excel_info = {
+                    "filename": output_excel_name,
+                    "description": f"Excel extracted from archive: {os.path.basename(excel_file_path)} (processing failed)",
+                    "error": str(excel_error),
+                    "source": "archive_extraction"
+                }
+                extracted_excel_data.append(excel_info)
+                
+        except Exception as e:
+            print(f"❌ Error processing extracted Excel {excel_file_path}: {e}")
+
     # Step 3.5: Handle provided PDF file
     # Step 3.5: Handle provided PDF file (enhanced)
     uploaded_pdf_data = []
@@ -2688,6 +2979,23 @@ async def aianalyst(request: Request):
         if fn:
             created_files.add(os.path.normpath(fn))
 
+    # Step 5.6: Process local Excel files
+    print("📊 Processing local Excel files...")
+    local_excel_data = await process_excel_files()
+    excel_csv_files = []
+    for workbook_info in local_excel_data:
+        # Add all generated CSV files to created_files for cleanup
+        for sheet_info in workbook_info['sheets_data']:
+            csv_filename = sheet_info['csv_filename']
+            if csv_filename:
+                created_files.add(os.path.normpath(csv_filename))
+                excel_csv_files.append(csv_filename)
+        
+        # Add summary file to created files
+        safe_filename = re.sub(r'[^\w\-_\.]', '_', os.path.splitext(workbook_info['filename'])[0])
+        summary_filename = f"excel_summary_{safe_filename}.txt"
+        created_files.add(os.path.normpath(summary_filename))
+
     # Combine uploaded, local, and extracted PDF data
     pdf_data = uploaded_pdf_data + local_pdf_data + extracted_pdf_data
     
@@ -2804,6 +3112,7 @@ async def aianalyst(request: Request):
         extracted_csv_data,
         extracted_html_data,
         extracted_json_data,
+        extracted_excel_data,
         extracted_sql_data,
         extracted_data_files_list
     )
