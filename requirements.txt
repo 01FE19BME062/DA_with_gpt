@@ -21,3 +21,4 @@ pdfplumber
 selenium
 webdriver-manager
 chromedriver-autoinstaller
+openpyxl
