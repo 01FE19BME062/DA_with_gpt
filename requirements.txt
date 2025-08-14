@@ -17,7 +17,6 @@ requests==2.32.4
 tabula-py==2.9.0
 uvicorn==0.35.0
 scipy
-data_scrape
 pdfplumber
 selenium
 webdriver-manager
