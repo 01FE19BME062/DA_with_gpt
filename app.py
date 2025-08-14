@@ -848,6 +848,172 @@ async def extract_pdf_with_pdfplumber(pdf_file_path: str) -> list:
         
     return tables
 
+async def process_image_with_gemini_and_ocr(image_bytes: bytes, filename: str, question_text: str) -> str:
+    """Enhanced image processing with Gemini Pro as primary handler and OCR as fallback"""
+    try:
+        print(f"🖼️ Processing image: {filename}")
+        
+        # First, try Gemini Pro for image analysis
+        try:
+            print("🤖 Attempting Gemini Pro image analysis...")
+            gemini_result = await process_image_with_gemini_pro(image_bytes, filename, question_text)
+            
+            # If Gemini Pro successfully extracted meaningful content, use it
+            if gemini_result and gemini_result != question_text:
+                print("✅ Gemini Pro successfully processed the image")
+                return gemini_result
+            else:
+                print("⚠️ Gemini Pro didn't extract meaningful content, falling back to OCR...")
+                
+        except Exception as gemini_error:
+            print(f"⚠️ Gemini Pro image processing failed: {gemini_error}")
+            print("🔄 Falling back to OCR...")
+        
+        # Fallback to OCR if Gemini Pro fails or returns insufficient content
+        return await process_image_with_enhanced_ocr(image_bytes, filename, question_text)
+        
+    except Exception as e:
+        print(f"❌ Error processing image {filename}: {e}")
+        return question_text
+
+async def process_image_with_gemini_pro(image_bytes: bytes, filename: str, question_text: str) -> str:
+    """Process image using Gemini Pro's vision capabilities"""
+    try:
+        # Convert image to base64 for Gemini Pro
+        import base64
+        base64_image = base64.b64encode(image_bytes).decode("utf-8")
+        
+        # Determine image format from filename
+        filename_lower = filename.lower()
+        if filename_lower.endswith(('.jpg', '.jpeg')):
+            mime_type = "image/jpeg"
+        elif filename_lower.endswith('.png'):
+            mime_type = "image/png"
+        elif filename_lower.endswith('.gif'):
+            mime_type = "image/gif"
+        elif filename_lower.endswith('.webp'):
+            mime_type = "image/webp"
+        elif filename_lower.endswith('.bmp'):
+            mime_type = "image/bmp"
+        else:
+            # Default to JPEG for unknown formats
+            mime_type = "image/jpeg"
+        
+        # Create comprehensive prompt for image analysis
+        image_analysis_prompt = f"""
+        Analyze this image and extract ALL relevant information. The image may contain:
+        - Tables, charts, graphs, or data visualizations
+        - Text content, questions, or instructions
+        - Forms, documents, or structured data
+        - Mathematical formulas or equations
+        - Screenshots of applications or websites
+        
+        Original context: {question_text}
+        
+        Please provide:
+        1. A detailed description of what you see in the image
+        2. Extract any text content (including tables, labels, titles)
+        3. If there are data tables, provide the data in structured format
+        4. If there are charts/graphs, describe the data and values shown
+        5. If there are questions in the image, list them clearly
+        6. If there are any numerical values, calculations, or data points, extract them
+        7. Identify any specific requests or tasks mentioned in the image
+        
+        Format your response to be directly usable for data analysis. If you see structured data, 
+        present it in a clear, parseable format.
+        """
+        
+        # Prepare payload for Gemini Pro API
+        payload = {
+            "contents": [
+                {
+                    "parts": [
+                        {
+                            "text": image_analysis_prompt
+                        },
+                        {
+                            "inline_data": {
+                                "mime_type": mime_type,
+                                "data": base64_image
+                            }
+                        }
+                    ]
+                }
+            ],
+            "generationConfig": {
+                "temperature": 0.1,
+                "maxOutputTokens": 2048
+            }
+        }
+        
+        # Try with both API keys (alternating like other functions)
+        max_tries = 2
+        for try_num in range(max_tries):
+            api_key = gemini_api if try_num % 2 == 0 else gemini_api_2
+            
+            try:
+                headers = {
+                    "Content-Type": "application/json",
+                    "X-goog-api-key": api_key
+                }
+                
+                # Use the correct Gemini Pro endpoint for vision
+                gemini_vision_url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+                
+                async with httpx.AsyncClient(timeout=60) as client:
+                    response = await client.post(gemini_vision_url, headers=headers, json=payload)
+                    
+                    if response.status_code == 200:
+                        result = response.json()
+                        
+                        if "candidates" in result and result["candidates"]:
+                            extracted_content = result["candidates"][0]["content"]["parts"][0]["text"]
+                            
+                            if extracted_content and extracted_content.strip():
+                                # Enhance the original question with extracted content
+                                enhanced_question = question_text + f"\n\nExtracted from image analysis ({filename}):\n{extracted_content}"
+                                
+                                # Analyze what type of content was found and add context
+                                content_lower = extracted_content.lower()
+                                
+                                # Check for data patterns
+                                if any(keyword in content_lower for keyword in ['table', 'data', 'row', 'column', 'chart', 'graph']):
+                                    enhanced_question += f"\n\nData Analysis Request: Please analyze the data content shown in the image."
+                                
+                                # Check for questions
+                                if any(keyword in content_lower for keyword in ['?', 'what', 'how', 'when', 'where', 'why', 'which', 'calculate', 'find']):
+                                    enhanced_question += f"\n\nQuestions/Tasks found in image - please address them."
+                                
+                                # Check for numerical data
+                                import re
+                                if re.search(r'\d+[.,]\d+|\$\d+|\d+%', extracted_content):
+                                    enhanced_question += f"\n\nNumerical data detected in image - please extract and analyze."
+                                
+                                print(f"✅ Gemini Pro extracted content from {filename}")
+                                print(f"📝 Content preview: {extracted_content[:200]}...")
+                                return enhanced_question
+                            else:
+                                print(f"⚠️ Gemini Pro returned empty content for {filename}")
+                                
+                    else:
+                        print(f"❌ Gemini Pro API error: {response.status_code} - {response.text}")
+                        
+            except Exception as api_error:
+                print(f"❌ Gemini Pro API call failed (attempt {try_num + 1}): {api_error}")
+                if try_num < max_tries - 1:
+                    print("🔄 Retrying with alternate API key...")
+                    continue
+                else:
+                    raise api_error
+        
+        # If we get here, all attempts failed
+        print(f"❌ All Gemini Pro attempts failed for {filename}")
+        return question_text
+        
+    except Exception as e:
+        print(f"❌ Gemini Pro image processing error for {filename}: {e}")
+        raise e
+
 async def process_image_with_enhanced_ocr(image_bytes: bytes, filename: str, question_text: str) -> str:
     """Enhanced image processing with content analysis"""
     try:
@@ -1369,7 +1535,7 @@ async def aianalyst(request: Request):
     if image:
         try:
             image_bytes = await image.read()
-            question_text = await process_image_with_enhanced_ocr(image_bytes, image.filename, question_text)
+            question_text = await process_image_with_gemini_and_ocr(image_bytes, image.filename, question_text)
         except Exception as e:
             print(f"❌ Error extracting text from image: {e}")
 
@@ -1416,7 +1582,7 @@ async def aianalyst(request: Request):
                         image_bytes = f.read()
                     
                     filename = os.path.basename(img_file_path)
-                    question_text = await process_image_with_enhanced_ocr(image_bytes, f"archive_{filename}", question_text)
+                    question_text = await process_image_with_gemini_and_ocr(image_bytes, f"archive_{filename}", question_text)
                     
                 except Exception as e:
                     print(f"❌ Error processing extracted image {img_file_path}: {e}")
